@@ -2600,7 +2600,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.22" },
     { name = "pandas", specifier = ">=1.4" },
     { name = "pyside6", specifier = ">=6.5" },
-    { name = "pyvista", specifier = ">=0.43" },
+    { name = "pyvista", specifier = ">=0.44" },
     { name = "pyvista", extras = ["jupyter"], marker = "extra == 'notebook'", specifier = ">=0.43" },
     { name = "pyvistaqt", specifier = ">=0.11" },
     { name = "scipy", specifier = ">=1.8" },

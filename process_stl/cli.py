@@ -41,6 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
     prot.add_argument("--cache-dir", default=CACHE_DIR,
                       help="relative to src_dir; 'none' disables the cache")
     prot.add_argument("--force", action="store_true", help="ignore the cache")
+    prot.add_argument("--bregma-lambda", type=float,
+                      help="bregma-lambda distance (mm) for the relative AP translation "
+                           "(default: read from a JSON of src_dir)")
     prot.add_argument("--json", help="save the protocol to this JSON file")
     prot.add_argument("--csv", help="add the protocol as a row of this CSV (created if missing)")
     prot.add_argument("--plot", choices=["none", "points", "surface"], default="none")
@@ -62,7 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_protocol(args):
     from .protocol import (
+        BREGMA_LAMBDA_KEY,
         append_protocol_csv,
+        find_bregma_lambda,
         format_protocol,
         get_insertion_protocol,
         save_protocol,
@@ -78,11 +83,20 @@ def run_protocol(args):
     for label, reg in regions.items():
         lcom = f", left CoM {np.round(reg.lcom, 3)}" if reg.is_double else ""
         print(f"{label:>14}: {reg.path.name}, CoM {np.round(reg.com, 3)}{lcom}")
-    prot = get_insertion_protocol(regions)
+    bregma_lambda = args.bregma_lambda
+    if bregma_lambda is None:
+        bregma_lambda, bl_json = find_bregma_lambda(args.src_dir)
+        if bregma_lambda is None:
+            print(f"No {BREGMA_LAMBDA_KEY} in the JSON files of {args.src_dir}: "
+                  "no relative AP translation")
+        else:
+            print(f"Bregma-lambda distance: {bregma_lambda:.4f} mm (from {bl_json.name})")
+    prot = get_insertion_protocol(regions, bregma_lambda)
     print(format_protocol(prot))
 
     if args.json:
         save_protocol(args.json, prot, regions, origin="center of mass",
+                      bregma_lambda_distance=bregma_lambda,
                       settings={"n_points": args.n_points, "com_method": args.com_method})
         print(f"Protocol saved to {args.json}")
     if args.csv:

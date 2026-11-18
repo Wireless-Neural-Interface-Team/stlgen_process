@@ -4,6 +4,11 @@ build / edit / compare insertion protocols on it.
 Each protocol is either computed from the centers of mass, loaded from a JSON
 file (e.g. the protocol of another skull), or typed by hand, and can then be
 edited; every protocol shown is drawn on the current geometry.
+
+The AP translation of each protocol is applied either as saved ("absolute") or
+as its relative value times the bregma-lambda distance of the current skull
+("relative"). That distance is read from a JSON of the source directory and
+is shown read-only; the JSON it comes from can be chosen.
 """
 
 from __future__ import annotations
@@ -44,20 +49,28 @@ from PySide6.QtWidgets import (
 from ... import viz
 from ...mesh import find_stl_files
 from ...protocol import (
+    AP_MODES,
+    BREGMA_LAMBDA_KEY,
     CSV_COLUMNS,
     append_protocol_csv,
+    apply_ap_mode,
+    bregma_lambda_files,
     count_csv_rows,
     entry_point,
     get_insertion_protocol,
     load_protocol,
     make_protocol,
+    read_bregma_lambda,
     save_protocol,
     target_offset,
     target_point,
+    with_relative_ap,
 )
+from ...sections import TARGETS as SECTION_TARGETS
+from ...sections import format_lengths, protocol_lengths
 from ...regions import CACHE_DIR, COM_METHOD, COM_METHODS, N_POINTS, REGIONS
 from ..widgets import CheckMenu, ColorButton, LogBox, Viewer3D, path_row
-from ..workers import MeshWorker, RegionsWorker
+from ..workers import MeshWorker, RegionsWorker, SectionsWorker
 
 NONE_ITEM = "(none)"
 OTHER = "other"  # display settings shared by the extra parts
@@ -107,12 +120,14 @@ class ProtocolEntry:
     regions: dict | None = None  # geometry it was computed from (JSON export)
     settings: dict = field(default_factory=dict)
     visible: bool = True
+    ap_mode: str = "absolute"    # key of AP_MODES
 
     def title(self) -> str:
         text = self.name
         if self.origin:
             text += f" — {self.origin}"
-        return text + (" (edited)" if self.modified else "")
+        text += " (edited)" if self.modified else ""
+        return text + (" [AP relative]" if self.ap_mode == "relative" else "")
 
 
 class ProtocolTab(QWidget):
@@ -123,10 +138,14 @@ class ProtocolTab(QWidget):
         self.protocols: list[ProtocolEntry] = []
         self._pending_protocol: ProtocolEntry | None = None  # waiting for the CoM
         self._updating = False         # filling the protocol widgets
+        self._bl_value = None          # bregma-lambda distance (mm) of the current skull
+        self._bl_extra = []            # JSON files picked outside the directory
         self._meshes: dict = {}        # str(path) -> pv.PolyData (surfaces, parts)
         self.parts: list[Path] = []    # other STLs of the directory, shown only
         self._worker = None
         self._mesh_worker = None
+        self._sections = None          # label -> RegionMesh, to measure the sections
+        self._sections_worker = None
         self._camera_set = False
 
         self.viewer = Viewer3D()
@@ -169,6 +188,23 @@ class ProtocolTab(QWidget):
             combo.currentTextChanged.connect(self._refresh_buttons)
             self.file_combos[label] = combo
             src_l.addRow(f"{label}:", combo)
+        bl_json_row = QHBoxLayout()
+        self.bl_json_combo = QComboBox()
+        self.bl_json_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.bl_json_combo.setMinimumContentsLength(20)
+        self.bl_json_combo.setToolTip(f"JSON file the bregma-lambda distance is read from "
+                                      f"('{BREGMA_LAMBDA_KEY}' key)")
+        self.bl_json_combo.currentIndexChanged.connect(self._on_bl_json_changed)
+        bl_browse = QPushButton("Browse…")
+        bl_browse.setToolTip("pick a JSON file outside the directory")
+        bl_browse.clicked.connect(self._on_browse_bl_json)
+        bl_json_row.addWidget(self.bl_json_combo, stretch=1)
+        bl_json_row.addWidget(bl_browse)
+        src_l.addRow("Skull JSON:", bl_json_row)
+        self.bl_label = QLabel("unknown")
+        self.bl_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        src_l.addRow("Bregma–lambda:", self.bl_label)
         root.addWidget(src_box)
 
         # --- centers of mass
@@ -241,7 +277,13 @@ class ProtocolTab(QWidget):
         self.load_btn = QPushButton("Load…")
         self.load_btn.setToolTip("protocol JSON file, e.g. computed on another geometry")
         self.load_btn.clicked.connect(self._on_load_protocol)
+        # optimize: experimental optimized protocol (remove with optimize_dialog.py)
+        self.optimize_btn = QPushButton("Optimize…")
+        self.optimize_btn.setToolTip("search the protocol maximizing the electrode length "
+                                     "inside both the visual cortex and the dLGN")
+        self.optimize_btn.clicked.connect(self._on_optimize)
         source_row.addWidget(self.from_com_btn)
+        source_row.addWidget(self.optimize_btn)  # optimize
         source_row.addWidget(self.load_btn)
         prot_l.addRow(source_row)
 
@@ -265,18 +307,40 @@ class ProtocolTab(QWidget):
                 rot_row.addWidget(spin, stretch=1)
                 rot_row.addWidget(self.rad_label)
                 prot_l.addRow(text, rot_row)
+            elif key == "AP_tr":
+                self.ap_mode_combo = QComboBox()
+                for i, (mode, desc) in enumerate(AP_MODES.items()):
+                    self.ap_mode_combo.addItem(mode)
+                    self.ap_mode_combo.setItemData(i, desc, Qt.ToolTipRole)
+                self.ap_mode_combo.setToolTip(
+                    "absolute: AP translation as saved\nrelative: relative AP translation "
+                    "of the protocol x bregma-lambda distance of the current skull")
+                self.ap_mode_combo.currentTextChanged.connect(self._on_ap_mode_changed)
+                prot_l.addRow("AP mode:", self.ap_mode_combo)
+                ap_row = QHBoxLayout()
+                self.ap_rel_label = QLabel("")
+                self.ap_rel_label.setToolTip("relative AP translation: AP translation / "
+                                             "bregma-lambda distance")
+                self.ap_rel_btn = QPushButton("Compute relative")
+                self.ap_rel_btn.setToolTip("relative AP translation = AP translation / "
+                                           "bregma-lambda distance of the current skull JSON")
+                self.ap_rel_btn.clicked.connect(self._on_compute_relative)
+                ap_row.addWidget(spin, stretch=1)
+                ap_row.addWidget(self.ap_rel_label)
+                ap_row.addWidget(self.ap_rel_btn)
+                prot_l.addRow(text, ap_row)
             else:
                 prot_l.addRow(text, spin)
         self.point_labels = {}
         for key, text in [("entry", "Entry (AP, ML, DV):"), ("target", "Target (AP, ML, DV):"),
-                          ("offset", "Target − C_dLGN:")]:
+                          ("section", "Section:")]:
             lab = QLabel("—")
             lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
             self.point_labels[key] = lab
             prot_l.addRow(text, lab)
-        self.point_labels["offset"].setToolTip(
-            "distance (AP, ML, DV) from the dLGN left center of mass of the loaded "
-            "geometry to the protocol target")
+        self.point_labels["section"].setToolTip(
+            "length of the electrode inside the dLGN and the visual cortex (VS) "
+            "of the loaded geometry")
 
         last_row = QHBoxLayout()
         self.view_check = QCheckBox("View")
@@ -436,9 +500,95 @@ class ProtocolTab(QWidget):
                 combo.setCurrentIndex(0 if label == "skull" else -1)
         if src and names:
             self.log_box.log(f"{len(names)} STL file(s) in {src}")
+        self._fill_bl_jsons(src)
         if any(p.parent != Path(src) for p in self.parts):
             self._set_parts([p for p in self.parts if p.parent == Path(src)])
         self._refresh_buttons()
+
+    def _fill_bl_jsons(self, src):
+        """List the JSON files of the directory that hold a bregma-lambda distance."""
+        found = bregma_lambda_files(src) if src and Path(src).is_dir() else {}
+        previous = self.bl_json_combo.currentData()
+        self._bl_extra = [p for p in self._bl_extra if p not in found]
+        self.bl_json_combo.blockSignals(True)
+        self.bl_json_combo.clear()
+        self.bl_json_combo.addItem(NONE_ITEM, None)
+        for path in found:
+            self.bl_json_combo.addItem(path.name, path)
+            self.bl_json_combo.setItemData(self.bl_json_combo.count() - 1, str(path),
+                                           Qt.ToolTipRole)
+        for path in self._bl_extra:
+            self.bl_json_combo.addItem(str(path), path)
+        paths = list(found) + self._bl_extra
+        index = (paths.index(previous) + 1 if previous in paths
+                 else 1 if paths else 0)
+        self.bl_json_combo.setCurrentIndex(index)
+        self.bl_json_combo.blockSignals(False)
+        if len(set(found.values())) > 1:
+            self.log_box.log("warning: the JSON files give different bregma-lambda "
+                             "distances: " + ", ".join(f"{p.name}={v:.4f}"
+                                                       for p, v in found.items()))
+        elif src and not found:
+            self.log_box.log(f"no JSON with '{BREGMA_LAMBDA_KEY}' in {src}")
+        self._on_bl_json_changed()
+
+    def _on_browse_bl_json(self):
+        start = self.dir_edit.text().strip()
+        name, _ = QFileDialog.getOpenFileName(self, "Skull JSON", start,
+                                              "JSON (*.json);;All files (*)")
+        if not name:
+            return
+        path = Path(name)
+        try:
+            read_bregma_lambda(path)
+        except ValueError as exc:
+            QMessageBox.critical(self, "No bregma-lambda distance", str(exc))
+            return
+        i = self.bl_json_combo.findData(path)
+        if i < 0:
+            self._bl_extra.append(path)
+            self.bl_json_combo.addItem(str(path), path)
+            i = self.bl_json_combo.count() - 1
+        self.bl_json_combo.setCurrentIndex(i)  # -> _on_bl_json_changed
+
+    def _on_bl_json_changed(self, *_):
+        path = self.bl_json_combo.currentData()
+        value = None
+        if path is not None:
+            try:
+                value = read_bregma_lambda(path)
+            except ValueError as exc:
+                self.log_box.log(f"error: {exc}")
+        changed = value != self._bl_value
+        self._bl_value = value
+        self.bl_label.setText("unknown" if value is None else f"{value:.4f} mm")
+        if value is not None and changed:
+            self.log_box.log(f"bregma-lambda distance {value:.4f} mm (from {path.name})")
+        if changed and hasattr(self, "save_btn"):  # UI built
+            self._show_protocol()
+            self._render()
+
+    def _bregma_lambda(self):
+        """Bregma-lambda distance (mm) of the current skull, None if unknown."""
+        return self._bl_value
+
+    def _on_compute_relative(self):
+        entry = self._current()
+        if entry is None or entry.prot is None:
+            return
+        try:
+            entry.prot = with_relative_ap(entry.prot, self._bregma_lambda())
+        except ValueError as exc:
+            QMessageBox.critical(self, "Cannot compute", str(exc))
+            return
+        entry.modified = True
+        path = self.bl_json_combo.currentData()
+        self.log_box.log(f"{entry.name}: relative AP {entry.prot['AP_tr_rel']:.4f} "
+                         f"= {entry.prot['AP_tr']:.3f} / {self._bregma_lambda():.4f} mm "
+                         f"(from {path.name})")
+        self._update_combo_item(entry)
+        self._show_protocol()
+        self._render()
 
     def _refresh_buttons(self, *_):
         if not hasattr(self, "save_btn"):  # still building the UI
@@ -449,6 +599,7 @@ class ProtocolTab(QWidget):
         entry = self._current()
         self.compute_btn.setEnabled(files_ok and not busy)
         self.from_com_btn.setEnabled(files_ok and not busy)
+        self.optimize_btn.setEnabled(bool(self.regions) and not busy)  # optimize
         self.remove_btn.setEnabled(len(self.protocols) > 1)
         self.save_btn.setEnabled(entry is not None and entry.prot is not None)
         self.save_png_btn.setEnabled(bool(self.regions) or self._shown_protocols() != [])
@@ -501,8 +652,30 @@ class ProtocolTab(QWidget):
         entry, self._pending_protocol = self._pending_protocol, None
         if entry is not None and entry in self.protocols:
             self._set_protocol_from_com(entry)
+        self._load_sections()
         self._show_protocol()  # offset to the new dLGN
         self._render()
+
+    def _load_sections(self):
+        self._sections = None
+        if not all(k in self.regions for k in SECTION_TARGETS):
+            return
+        worker = SectionsWorker(self.regions)
+        worker.log.connect(self.log_box.log)
+        worker.failed.connect(lambda msg: self.log_box.log(f"error (sections): {msg}"))
+        worker.finished_ok.connect(lambda meshes, w=worker: self._on_sections(w, meshes))
+        self._sections_worker = worker
+        worker.start()
+
+    def _on_sections(self, worker, meshes):
+        if worker is self._sections_worker:  # not from older regions
+            self._sections = meshes
+            self._show_protocol()
+
+    def _section_text(self, prot):
+        if self._sections is None:
+            return "measuring…" if self.regions else "—"
+        return format_lengths(protocol_lengths(prot, self._sections))
 
     def _show_com_table(self):
         self.com_table.setRowCount(len(self.regions))
@@ -559,16 +732,19 @@ class ProtocolTab(QWidget):
             self._start_com(then_protocol=entry)
 
     def _set_protocol_from_com(self, entry):
-        entry.prot = get_insertion_protocol(self.regions)
+        entry.prot = get_insertion_protocol(self.regions, self._bregma_lambda())
         entry.origin = f"CoM of {self._geometry_name()}"
         entry.modified = False
         entry.regions = dict(self.regions)
         entry.settings = {"n_points": self.n_points_spin.value(),
-                          "com_method": self.method_combo.currentText()}
+                          "com_method": self.method_combo.currentText(),
+                          "bregma_lambda_distance": self._bregma_lambda()}
         entry.visible = True
         self._update_combo_item(entry)
         self.log_box.log(f"{entry.name}: computed from the centers of mass of "
                          f"{self._geometry_name()}")
+        if entry.prot["AP_tr_rel"] is None:
+            self.log_box.log("  bregma-lambda distance unknown: no relative AP translation")
 
     def _on_load_protocol(self):
         entry = self._current()
@@ -588,6 +764,39 @@ class ProtocolTab(QWidget):
         entry.regions, entry.settings, entry.visible = None, {"file": str(path)}, True
         self._update_combo_item(entry)
         self.log_box.log(f"{entry.name}: loaded from {path}")
+        if prot["AP_tr_rel"] is None and entry.ap_mode == "relative":
+            self.log_box.log(f"  warning: {Path(path).name} has no relative AP translation")
+        self._show_protocol()
+        self._render()
+
+    # optimize: experimental optimized protocol (remove with optimize_dialog.py)
+    def _on_optimize(self):
+        from ..optimize_dialog import OptimizeDialog
+
+        entry = self._current()
+        if entry is None or not self.regions:
+            return
+        start = self._applied(entry)[0] or get_insertion_protocol(self.regions)
+        dialog = OptimizeDialog(self.regions, start, self._bregma_lambda(),
+                                self._geometry_name(), self)
+        if not dialog.exec() or dialog.result is None:
+            return
+        result = dialog.result
+        entry.prot = result["protocol"]
+        entry.origin = f"optimized on {self._geometry_name()}"
+        entry.modified = False
+        entry.regions = dict(self.regions)
+        entry.settings = {"n_points": self.n_points_spin.value(),
+                          "com_method": self.method_combo.currentText(),
+                          "bregma_lambda_distance": self._bregma_lambda(),
+                          "optimization": {**result["settings"],
+                                           "lengths": result["lengths"],
+                                           "score": result["score"]}}
+        entry.visible = True
+        entry.ap_mode = "absolute"  # optimized on this skull
+        self._update_combo_item(entry)
+        self.log_box.log(f"{entry.name}: optimized, inside " + ", ".join(
+            f"{k} {v:.3f} mm" for k, v in result["lengths"].items()))
         self._show_protocol()
         self._render()
 
@@ -598,21 +807,50 @@ class ProtocolTab(QWidget):
         entry = self._current()
         if entry is None:
             return
+        bl = self._bregma_lambda()
         if entry.prot is None:  # typed from scratch
-            entry.prot = make_protocol(0.0, 0.0, 0.0, ML_rot_deg=0.0)
+            entry.prot = make_protocol(0.0, 0.0, 0.0, ML_rot_deg=0.0,
+                                       AP_tr_rel=0.0 if bl else None)
             entry.origin = "manual"
             entry.visible = True
         else:
             entry.modified = True
+        p = entry.prot
         if key == "ML_rot_deg":
-            p = entry.prot
             entry.prot = make_protocol(p["ML_tr"], p["AP_tr"], p["Insert_tr"],
-                                       ML_rot_deg=value)
+                                       ML_rot_deg=value, AP_tr_rel=p.get("AP_tr_rel"))
+        elif key == "AP_tr":
+            # the AP translation typed is the one of the current skull
+            entry.prot = {**p, "AP_tr": float(value),
+                          "AP_tr_rel": float(value) / bl if bl else None}
         else:
             entry.prot[key] = float(value)
         self._update_combo_item(entry)
         self._show_protocol()
         self._render()
+
+    def _on_ap_mode_changed(self, mode):
+        entry = self._current()
+        if entry is None or self._updating:
+            return
+        entry.ap_mode = mode
+        self._update_combo_item(entry)
+        _, error = self._applied(entry)
+        if error:
+            self.log_box.log(f"{entry.name}: relative AP not applicable: {error}")
+        self._show_protocol()
+        self._render()
+
+    def _applied(self, entry):
+        """(protocol applied to the current skull, error message): the AP
+        translation follows the AP mode of the entry. (None, None) if the entry
+        has no protocol, (None, reason) if the relative mode cannot be applied."""
+        if entry is None or entry.prot is None:
+            return None, None
+        try:
+            return apply_ap_mode(entry.prot, entry.ap_mode, self._bregma_lambda()), None
+        except ValueError as exc:
+            return None, str(exc)
 
     def _on_view_toggled(self, checked):
         entry = self._current()
@@ -637,18 +875,32 @@ class ProtocolTab(QWidget):
         entry = self._current()
         if entry is None:
             return
-        p = entry.prot
+        applied, error = self._applied(entry)
+        p = applied or entry.prot  # the stored values if relative is not applicable
         self._updating = True
         for key, spin in self.protocol_spins.items():
             spin.setValue(p[key] if p is not None else 0.0)
+        self.ap_mode_combo.setCurrentText(entry.ap_mode)
         self.view_check.setChecked(entry.visible)
         self.view_check.setEnabled(p is not None)
         self._updating = False
 
+        rel = None if p is None else p.get("AP_tr_rel")
+        self.ap_rel_label.setText("" if p is None else
+                                  "no relative value" if rel is None else
+                                  f"= {rel:.4f} × BL")
+        self.ap_rel_btn.setVisible(p is not None and rel is None)
+        self.ap_rel_btn.setEnabled(self._bregma_lambda() is not None)
         if p is None:
             self.origin_label.setText("none yet: compute from CoM, load a file, "
                                       "or type the values")
             self.rad_label.setText("")
+            for lab in self.point_labels.values():
+                lab.setText("—")
+        elif applied is None:
+            self.origin_label.setText(entry.origin + (" (edited)" if entry.modified else "")
+                                      + f"\nnot drawn: {error}")
+            self.rad_label.setText(f"{p['ML_rot']:.4f} rad")
             for lab in self.point_labels.values():
                 lab.setText("—")
         else:
@@ -656,10 +908,7 @@ class ProtocolTab(QWidget):
             self.rad_label.setText(f"{p['ML_rot']:.4f} rad")
             self.point_labels["entry"].setText(_fmt(entry_point(p)))
             self.point_labels["target"].setText(_fmt(target_point(p)))
-            d = self._offset(p)
-            self.point_labels["offset"].setText(
-                "—" if d is None else
-                f"{np.linalg.norm(d):.3f} mm  (" + ", ".join(f"{x:+.3f}" for x in d) + ")")
+            self.point_labels["section"].setText(self._section_text(p))
         self._refresh_buttons()
 
     def _on_protocol_selected(self, *_):
@@ -670,6 +919,10 @@ class ProtocolTab(QWidget):
     def _on_save_protocol(self):
         entry = self._current()
         if entry is None or entry.prot is None:
+            return
+        prot, error = self._applied(entry)
+        if prot is None:
+            QMessageBox.critical(self, "Save failed", f"relative AP mode: {error}")
             return
         stem = re.sub(r"[^\w.-]+", "_", f"{self._geometry_name()}_{entry.name}").strip("_")
         start = str(Path(self.dir_edit.text().strip() or ".") / f"{stem}.json")
@@ -687,7 +940,7 @@ class ProtocolTab(QWidget):
         try:
             if path.suffix.lower() == ".csv":
                 n = count_csv_rows(path)
-                append_protocol_csv(path, entry.prot)
+                append_protocol_csv(path, prot)
                 self.log_box.log(f"{entry.name}: created {path}" if n is None else
                                  f"{entry.name}: added row {n + 1} to {path}")
             else:
@@ -695,8 +948,10 @@ class ProtocolTab(QWidget):
                         self, "Overwrite?", f"{path.name} already exists. Overwrite it?") \
                         != QMessageBox.StandardButton.Yes:
                     return
-                save_protocol(path, entry.prot, entry.regions, name=entry.name,
+                save_protocol(path, prot, entry.regions, name=entry.name,
                               origin=entry.origin, modified=entry.modified,
+                              ap_mode=entry.ap_mode,
+                              bregma_lambda_distance=self._bregma_lambda(),
                               settings=entry.settings)
                 self.log_box.log(f"{entry.name}: saved to {path}")
         except Exception as exc:
@@ -791,14 +1046,18 @@ class ProtocolTab(QWidget):
                                 if str(p) in self._meshes},
                       self.color_btns[OTHER].color(), self._opacity(OTHER), style)
         for entry in shown:
-            legend += viz.add_trajectory(plotter, entry.prot, color=entry.color,
+            prot = self._applied(entry)[0]
+            if prot is None:  # relative AP mode not applicable
+                continue
+            legend += viz.add_trajectory(plotter, prot, color=entry.color,
                                          title=entry.title(),
-                                         extra_lines=self._offset_lines(entry.prot))
+                                         extra_lines=self._offset_lines(prot))
 
         current = self._current()
+        current_prot = self._applied(current)[0]
         if (self.cranio_check.isChecked() and "skull" in self.regions
-                and current is not None and current.prot is not None):
-            viz.add_craniotomy(plotter, self.regions["skull"], current.prot,
+                and current_prot is not None):
+            viz.add_craniotomy(plotter, self.regions["skull"], current_prot,
                                self.thick_spin.value(), self.radius_spin.value(),
                                color=current.color)
 
@@ -833,4 +1092,6 @@ class ProtocolTab(QWidget):
         self._render()
 
     def shutdown(self):
+        if self._sections_worker is not None:
+            self._sections_worker.wait()
         self.viewer.close()

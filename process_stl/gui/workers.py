@@ -9,6 +9,7 @@ from __future__ import annotations
 from PySide6.QtCore import QThread, Signal
 
 from ..regions import load_regions
+from ..sections import load_meshes
 from ..stats import load_or_compute
 from ..viz import read_mesh
 
@@ -81,5 +82,24 @@ class StatsWorker(QThread):
             df = load_or_compute(self.folders, self.recursive, self.data_file,
                                  self.force, self.axes, log=self.log.emit)
             self.finished_ok.emit(df)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class SectionsWorker(QThread):
+    """Read the triangles of the visual cortex and dLGN, to measure the
+    electrode section inside them."""
+
+    log = Signal(str)
+    finished_ok = Signal(object)  # label -> sections.RegionMesh
+    failed = Signal(str)
+
+    def __init__(self, regions, parent=None):
+        super().__init__(parent)
+        self.regions = regions
+
+    def run(self):
+        try:
+            self.finished_ok.emit(load_meshes(self.regions, log=self.log.emit))
         except Exception as exc:
             self.failed.emit(str(exc))
